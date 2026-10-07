@@ -1,6 +1,6 @@
 /* ==================================================================
    ゴブレットゴブラーズ オンライン対戦 — Cloudflare Workers + Durable Objects
-   仕様書 v0.1 準拠（デバッグ用ヘッダー追加版）
+   仕様書 v0.1 準拠（WebSocket ハンドシェイク遅延修正版）
    ================================================================== */
 
 const CODE_CHARS = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -142,7 +142,6 @@ export default {
         return await stub.fetch(request);
       } catch (e) {
         const msg = e && e.message ? e.message : String(e);
-        // ★デバッグ用：エラー内容をヘッダーに入れる
         return new Response("Worker Error: " + msg, { status: 500, headers: { "X-Debug-Error": msg } });
       }
     }
@@ -208,19 +207,23 @@ export class RoomDO {
     return ++r.c <= 30;
   }
 
+  // ★修正箇所：fetch 内での await this.load() を削除し、即座に 101 を返す
   async fetch(request) {
     try {
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
-      await this.load();
+      
+      // 【重要】ここではストレージ読み込み(await)を行わない！
+      // WebSocket のハンドシェイクを遅延させないため。
+      
       const url = new URL(request.url);
       const code = normCode(url.searchParams.get("code"));
       if (!code) return new Response("bad code", { status: 400 });
+      
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], { code: code, token: null });
       return new Response(null, { status: 101, webSocket: pair[0] });
     } catch (e) {
       const msg = e && e.message ? e.message : String(e);
-      // ★デバッグ用：エラー内容をヘッダーに入れる
       return new Response("DO Error: " + msg, { status: 500, headers: { "X-Debug-Error": msg } });
     }
   }
@@ -230,7 +233,10 @@ export class RoomDO {
     let msg; try { msg = JSON.parse(message); } catch (e) { return; }
     if (!msg || typeof msg.ev !== "string") return;
     if (!this.rateOk(ws)) return;
+    
+    // ★データの読み込みは、実際にメッセージが届いたここで行う
     await this.load();
+    
     const att = ws.deserializeAttachment() || {};
     const reqId = msg.reqId != null ? String(msg.reqId).slice(0, 32) : null;
     const t = now();
