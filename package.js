@@ -1,6 +1,7 @@
 {
-  "name": "gobblers-online",
+  "name": "gobblers",
   "private": true,
+  "version": "1.0.0",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
@@ -9,4 +10,3 @@
     "wrangler": "^4.0.0"
   }
 }
-
