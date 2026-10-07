@@ -1,6 +1,6 @@
 /* ==================================================================
    ゴブレットゴブラーズ オンライン対戦 — Cloudflare Workers + Durable Objects
-   仕様書 v0.1 準拠（WebSocket ハンドシェイク遅延修正版）
+   仕様書 v0.1 準拠（WebSocketプロキシの await 削除・最終修正版）
    ================================================================== */
 
 const CODE_CHARS = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -139,7 +139,11 @@ export default {
       try {
         const id = env.ROOM.idFromName(code);
         const stub = env.ROOM.get(id);
-        return await stub.fetch(request);
+        
+        // ★★★【超重要】WebSocketをDOにプロキシする際は、絶対に await を付けないこと！★★★
+        // await を付けると、WebSocketストリームがCloudflareエッジで破壊され接続失敗(CONNECT_FAIL)します。
+        return stub.fetch(request);
+        
       } catch (e) {
         const msg = e && e.message ? e.message : String(e);
         return new Response("Worker Error: " + msg, { status: 500, headers: { "X-Debug-Error": msg } });
@@ -207,14 +211,10 @@ export class RoomDO {
     return ++r.c <= 30;
   }
 
-  // ★修正箇所：fetch 内での await this.load() を削除し、即座に 101 を返す
+  // ★DO側でもハンドシェイクを遅延させないため、await this.load() は行わない
   async fetch(request) {
     try {
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
-      
-      // 【重要】ここではストレージ読み込み(await)を行わない！
-      // WebSocket のハンドシェイクを遅延させないため。
-      
       const url = new URL(request.url);
       const code = normCode(url.searchParams.get("code"));
       if (!code) return new Response("bad code", { status: 400 });
@@ -234,7 +234,7 @@ export class RoomDO {
     if (!msg || typeof msg.ev !== "string") return;
     if (!this.rateOk(ws)) return;
     
-    // ★データの読み込みは、実際にメッセージが届いたここで行う
+    // メッセージが届いたタイミングで初めてストレージから読み込む
     await this.load();
     
     const att = ws.deserializeAttachment() || {};
