@@ -1,6 +1,6 @@
 /* ==================================================================
    ゴブレットゴブラーズ オンライン対戦 — Cloudflare Workers + Durable Objects
-   仕様書 v0.1 準拠（WebSocketプロキシの await 削除・最終修正版）
+   仕様書 v0.1 準拠（エラー詳細をHTML表示するデバッグ版）
    ================================================================== */
 
 const CODE_CHARS = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
@@ -139,14 +139,14 @@ export default {
       try {
         const id = env.ROOM.idFromName(code);
         const stub = env.ROOM.get(id);
-        
-        // ★★★【超重要】WebSocketをDOにプロキシする際は、絶対に await を付けないこと！★★★
-        // await を付けると、WebSocketストリームがCloudflareエッジで破壊され接続失敗(CONNECT_FAIL)します。
+        // ★重要: await を付けない
         return stub.fetch(request);
-        
       } catch (e) {
+        // ★エラーをHTMLで返し、ブラウザで直接見えるようにする
         const msg = e && e.message ? e.message : String(e);
-        return new Response("Worker Error: " + msg, { status: 500, headers: { "X-Debug-Error": msg } });
+        const stack = e && e.stack ? e.stack : "";
+        const html = `<h1>Worker /ws Error</h1><p style="color:red;word-break:break-all;">${msg}</p><pre style="white-space:pre-wrap;word-break:break-all;background:#f4f4f4;padding:10px;border:1px solid #ccc;">${stack}</pre>`;
+        return new Response(html, { status: 500, headers: { "Content-Type": "text/html; charset=utf-8" } });
       }
     }
     return env.ASSETS.fetch(request);
@@ -211,20 +211,21 @@ export class RoomDO {
     return ++r.c <= 30;
   }
 
-  // ★DO側でもハンドシェイクを遅延させないため、await this.load() は行わない
   async fetch(request) {
     try {
       if (request.headers.get("Upgrade") !== "websocket") return new Response("expected websocket", { status: 426 });
       const url = new URL(request.url);
       const code = normCode(url.searchParams.get("code"));
       if (!code) return new Response("bad code", { status: 400 });
-      
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1], { code: code, token: null });
       return new Response(null, { status: 101, webSocket: pair[0] });
     } catch (e) {
+      // ★エラーをHTMLで返し、ブラウザで直接見えるようにする
       const msg = e && e.message ? e.message : String(e);
-      return new Response("DO Error: " + msg, { status: 500, headers: { "X-Debug-Error": msg } });
+      const stack = e && e.stack ? e.stack : "";
+      const html = `<h1>DO fetch Error</h1><p style="color:red;word-break:break-all;">${msg}</p><pre style="white-space:pre-wrap;word-break:break-all;background:#f4f4f4;padding:10px;border:1px solid #ccc;">${stack}</pre>`;
+      return new Response(html, { status: 500, headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
   }
 
@@ -234,7 +235,6 @@ export class RoomDO {
     if (!msg || typeof msg.ev !== "string") return;
     if (!this.rateOk(ws)) return;
     
-    // メッセージが届いたタイミングで初めてストレージから読み込む
     await this.load();
     
     const att = ws.deserializeAttachment() || {};
