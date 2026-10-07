@@ -8,3 +8,6 @@ assets = { directory = "./public", binding = "ASSETS" }
 name = "ROOM"
 class_name = "RoomDO"
 
+[observability.logs]
+enabled = true
+invocation_logs = true
