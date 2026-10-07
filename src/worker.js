@@ -66,8 +66,6 @@ const G = {
     }
     return out;
   },
-
-  /* 8.1 手の合法性チェック */
   isLegal(st, mv, player) {
     if (!mv || typeof mv !== "object") return false;
     if (mv.type === "place") {
@@ -86,7 +84,6 @@ const G = {
     }
     return false;
   },
-
   legalMoves(st, player) {
     const out = [];
     for (const s of SIZES) {
@@ -109,7 +106,6 @@ const G = {
     }
     return out;
   },
-
   positionKey(st) {
     return (
       st.board.map((c) => c.map((p) => p.owner + p.size).join(",")).join("|") +
@@ -117,8 +113,6 @@ const G = {
       "#" + SIZES.map((s) => st.reserve.P1[s] + st.reserve.P2[s]).join("")
     );
   },
-
-  /* 8.2 勝敗判定の手順 */
   applyMove(prev, mv, settings) {
     const set = Object.assign({ simultaneous: "mover", repetition: true }, settings || {});
     const st = structuredClone(prev);
@@ -128,7 +122,6 @@ const G = {
     if (st.status !== "playing") return { ok: false, code: "NOT_PLAYING", message: "対戦中ではありません" };
     if (!G.isLegal(st, mv, player)) return { ok: false, code: "ILLEGAL_MOVE", message: "その手は指せません" };
 
-    // (2) 持ち上げ時の判定
     let revealedLine = null;
     if (mv.type === "move") {
       const lifted = G.cloneBoard(st.board);
@@ -168,7 +161,6 @@ const G = {
 
     if (revealedLine) return finish(opp, revealedLine, "LIFT");
 
-    // (3) 適用後の盤面で双方を判定
     const mine = G.findLines(st.board, player);
     const theirs = G.findLines(st.board, opp);
     if (mine.length || theirs.length) {
@@ -184,13 +176,11 @@ const G = {
     st.turn = opp;
     st.turnStartedAt = now();
 
-    // (4) 同一局面カウント（引き分け）
     st.positions = st.positions || {};
     const key = G.positionKey(st);
     st.positions[key] = (st.positions[key] || 0) + 1;
     if (set.repetition && st.positions[key] >= 3) return finish("draw", null, "REPETITION");
 
-    // (5) 次の手番に合法手がなければ負け
     if (G.legalMoves(st, opp).length === 0) return finish(player, null, "NOMOVES");
 
     return { ok: true, state: st, event: { kind: mv.type } };
@@ -198,7 +188,7 @@ const G = {
 };
 
 /* ==================================================================
-   2. メイン Worker（ルーティング）
+   2. メイン Worker（ルーティング）— エラーをテキストで返すデバッグモード
    ================================================================== */
 export default {
   async fetch(request, env) {
@@ -216,12 +206,14 @@ export default {
       }
       const code = normCode(url.searchParams.get("code"));
       if (!code) return new Response("missing code", { status: 400 });
-      const id = env.ROOM.idFromName(code);
-      const stub = env.ROOM.get(id);
-      const target = new URL(request.url);
-      target.searchParams.set("code", code);
-      const fwd = new Request(target.toString(), { method: request.method, headers: request.headers });
-      return stub.fetch(fwd);
+      try {
+        const id = env.ROOM.idFromName(code);
+        const stub = env.ROOM.get(id);
+        return await stub.fetch(request);
+      } catch (e) {
+        const msg = e && e.message ? e.message : String(e);
+        return new Response("Worker Error: " + msg, { status: 500 });
+      }
     }
 
     return env.ASSETS.fetch(request);
@@ -230,10 +222,12 @@ export default {
 
 /* ==================================================================
    3. ルーム Durable Object（Hibernation WebSocket API）
+      ★ state → ctx に変更済み
+      ★ fetch に try/catch を追加し、エラーをテキストで返す
    ================================================================== */
 export class RoomDO {
-  constructor(state, env) {
-    this.state = state;
+  constructor(ctx, env) {
+    this.ctx = ctx;
     this.env = env;
     this.room = null;
     this.loaded = false;
@@ -242,7 +236,7 @@ export class RoomDO {
 
   async load() {
     if (!this.loaded) {
-      this.room = (await this.state.storage.get("room")) || null;
+      this.room = (await this.ctx.storage.get("room")) || null;
       this.loaded = true;
     }
     return this.room;
@@ -250,11 +244,11 @@ export class RoomDO {
   async save() {
     if (!this.room) return;
     this.room.lastActiveAt = now();
-    await this.state.storage.put("room", this.room);
+    await this.ctx.storage.put("room", this.room);
   }
   async ensureAlarm() {
-    const cur = await this.state.storage.getAlarm();
-    if (!cur) await this.state.storage.setAlarm(now() + ALIVE_MS);
+    const cur = await this.ctx.storage.getAlarm();
+    if (!cur) await this.ctx.storage.setAlarm(now() + ALIVE_MS);
   }
 
   seatOfToken(token) {
@@ -278,13 +272,13 @@ export class RoomDO {
 
   broadcast(obj) {
     const s = JSON.stringify(obj);
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.ctx.getWebSockets()) {
       try { ws.send(s); } catch (e) {}
     }
   }
   async publish(meta) {
     const base = { ev: "room:state", room: this.pub(), meta: meta || null };
-    for (const ws of this.state.getWebSockets()) {
+    for (const ws of this.ctx.getWebSockets()) {
       try {
         const att = ws.deserializeAttachment();
         const you = att && att.token ? this.seatOfToken(att.token) : null;
@@ -311,16 +305,22 @@ export class RoomDO {
   }
 
   async fetch(request) {
-    await this.load();
-    if (request.headers.get("Upgrade") !== "websocket") {
-      return new Response("expected websocket", { status: 426 });
+    try {
+      if (request.headers.get("Upgrade") !== "websocket") {
+        return new Response("expected websocket", { status: 426 });
+      }
+      await this.load();
+      const url = new URL(request.url);
+      const code = normCode(url.searchParams.get("code"));
+      if (!code) return new Response("bad code", { status: 400 });
+      const pair = new WebSocketPair();
+      this.ctx.acceptWebSocket(pair[1], { code: code, token: null });
+      return new Response(null, { status: 101, webSocket: pair[0] });
+    } catch (e) {
+      const msg = e && e.message ? e.message : String(e);
+      const stack = e && e.stack ? e.stack : "";
+      return new Response("DO Error: " + msg + "\n" + stack, { status: 500 });
     }
-    const url = new URL(request.url);
-    const code = normCode(url.searchParams.get("code"));
-    if (!code) return new Response("bad code", { status: 400 });
-    const pair = new WebSocketPair();
-    this.state.acceptWebSocket(pair[1], { code: code, token: null });
-    return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
   async webSocketMessage(ws, message) {
@@ -353,11 +353,9 @@ export class RoomDO {
       }
 
       switch (msg.ev) {
-
         case "room:peek": {
           return this.ok(ws, reqId, { room: this.room ? this.pub() : null });
         }
-
         case "room:create": {
           if (this.room) return this.err(ws, reqId, "EXISTS", "このコードは使用中です。もう一度お試しください。");
           const token = crypto.randomUUID();
@@ -381,11 +379,9 @@ export class RoomDO {
           await this.publish({ joined: "P1" });
           return this.ok(ws, reqId, { seat: "P1", token: token, room: this.pub() });
         }
-
         case "room:join": {
           const room = this.room;
           if (!room) return this.err(ws, reqId, "NOT_FOUND", "ルームが見つかりません。コードを確認してください。");
-
           if (msg.token) {
             const seat = this.seatOfToken(msg.token);
             if (seat) {
@@ -400,10 +396,8 @@ export class RoomDO {
               return this.ok(ws, reqId, { seat: seat, token: msg.token, room: this.pub(), reconnected: true });
             }
           }
-
           const empty = !room.players.P1 ? "P1" : (!room.players.P2 ? "P2" : null);
           if (!empty) return this.err(ws, reqId, "FULL", "このルームは満員です（定員2名）。");
-
           const token = crypto.randomUUID();
           room.players[empty] = {
             name: sanitizeName(msg.name) || ("ゲスト" + (empty === "P1" ? 1 : 2)),
@@ -415,7 +409,6 @@ export class RoomDO {
           await this.publish({ joined: empty });
           return this.ok(ws, reqId, { seat: empty, token: token, room: this.pub() });
         }
-
         case "room:settings": {
           const seat = this.auth(att);
           if (!seat) return this.err(ws, reqId, "AUTH", "認証に失敗しました。再接続してください。");
@@ -431,7 +424,6 @@ export class RoomDO {
           await this.publish();
           return this.ok(ws, reqId, { room: this.pub(), seat: seat });
         }
-
         case "game:start": {
           const seat = this.auth(att);
           if (!seat) return this.err(ws, reqId, "AUTH", "認証に失敗しました。再接続してください。");
@@ -455,7 +447,6 @@ export class RoomDO {
           await this.publish({ started: true });
           return this.ok(ws, reqId, { room: this.pub(), seat: seat });
         }
-
         case "game:move": {
           const seat = this.auth(att);
           if (!seat) return this.err(ws, reqId, "AUTH", "認証に失敗しました。再接続してください。");
@@ -469,7 +460,6 @@ export class RoomDO {
           await this.publish({ event: res.event });
           return this.ok(ws, reqId, { room: this.pub(), seat: seat, event: res.event });
         }
-
         case "game:resign": {
           const seat = this.auth(att);
           if (!seat) return this.err(ws, reqId, "AUTH", "認証に失敗しました。");
@@ -485,7 +475,6 @@ export class RoomDO {
           await this.publish({ event: { kind: "win", winner: room.game.winner, reason: "RESIGN" } });
           return this.ok(ws, reqId, { room: this.pub(), seat: seat });
         }
-
         case "game:claimwin": {
           const seat = this.auth(att);
           if (!seat) return this.err(ws, reqId, "AUTH", "認証に失敗しました。");
@@ -506,7 +495,6 @@ export class RoomDO {
           await this.publish({ event: { kind: "win", winner: seat, reason: "ABANDON" } });
           return this.ok(ws, reqId, { room: this.pub(), seat: seat });
         }
-
         case "game:rematch": {
           const seat = this.auth(att);
           if (!seat) return this.err(ws, reqId, "AUTH", "認証に失敗しました。");
@@ -535,7 +523,6 @@ export class RoomDO {
           await this.publish(started ? { started: true } : { rematchRequested: seat });
           return this.ok(ws, reqId, { room: this.pub(), seat: this.auth(att), started: started });
         }
-
         case "room:leave": {
           const seat = this.auth(att);
           if (!seat) return this.ok(ws, reqId, {});
@@ -556,7 +543,6 @@ export class RoomDO {
           await this.publish({ left: seat });
           return this.ok(ws, reqId, {});
         }
-
         default:
           return this.err(ws, reqId, "UNKNOWN", "不明なイベントです: " + msg.ev);
       }
@@ -575,7 +561,7 @@ export class RoomDO {
       if (!att || !att.token || !this.room) return;
       const seat = this.seatOfToken(att.token);
       if (!seat) return;
-      const stillLive = this.state.getWebSockets().some((s) => {
+      const stillLive = this.ctx.getWebSockets().some((s) => {
         if (s === ws) return false;
         const a = s.deserializeAttachment();
         return !!(a && a.token === att.token);
@@ -595,7 +581,7 @@ export class RoomDO {
     if (!this.room) return;
     const t = now();
     const live = new Set();
-    for (const s of this.state.getWebSockets()) {
+    for (const s of this.ctx.getWebSockets()) {
       const a = s.deserializeAttachment();
       if (a && a.token) {
         const seat = this.seatOfToken(a.token);
@@ -612,12 +598,12 @@ export class RoomDO {
       await this.publish({ presence: true });
     }
     if (live.size > 0) {
-      await this.state.storage.setAlarm(t + ALIVE_MS);
+      await this.ctx.storage.setAlarm(t + ALIVE_MS);
     } else if (t - (this.room.lastActiveAt || 0) >= ROOM_TTL) {
-      await this.state.storage.deleteAll();
+      await this.ctx.storage.deleteAll();
       this.room = null;
     } else {
-      await this.state.storage.setAlarm(Math.min(t + 60000, (this.room.lastActiveAt || t) + ROOM_TTL));
+      await this.ctx.storage.setAlarm(Math.min(t + 60000, (this.room.lastActiveAt || t) + ROOM_TTL));
     }
   }
 }
